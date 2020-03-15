@@ -1,3 +1,6 @@
+// A fork of Matt-Prophet's Subduino Project
+// https://github.com/alan-polk/subduino
+
 // This is a simple sketch to read the battery volrate
 // form a subaru ECU via SSM using MC33660 chip
 // Usful for testing that all hardware and wiring is correct
