@@ -1,196 +1,788 @@
-// A fork of Matt-Prophet's Subduino Project
+// A fork of Matt-Prophet's Sudnuino Program
 // https://github.com/alan-polk/subduino
 
-// This is a simple sketch to read the battery volrate
-// form a subaru ECU via SSM using MC33660 chip
-// Usful for testing that all hardware and wiring is correct
-// When loaded you should be able to see your battery voltage in serial monitor
+// This program reads all the relevant parameters from
+// the ECU and prints them to serial monitor
+// for debugging and troubleshooting
 
+// ------------------------------------------------
+// INCLUDES
+// ------------------------------------------------
 
+#include <Arduino.h>
 #include <SoftwareSerial.h>
 
-SoftwareSerial kLine = SoftwareSerial(10, 11); //Rx, Tx
+// ------------------------------------------------
+// END INCLUDES
+// ------------------------------------------------
 
+// ------------------------------------------------
+// DEBUG
+// ------------------------------------------------
 
-//the requests include the 3-byte address of the data byte that we want to read from ECU memory
-//msg format = {header,to,from,# data bytes,read type flag(?),continuous response request flag,addr part 1,addr part 2, addr part 3,..., checksum}
-uint8_t pollECU_BattVolt[10] = {128, 16, 240, 5, 168, 0, 0x00, 0x00, 0x1C, 0x49}; //response [X]
-uint8_t ECUResponseBuffer[2] = {0, 0};//the longest number of bytes we get from the ECU in response to our queries is 2 bytes
+// AP - Debug logging: To turn on/off DPRINT statements, comment/uncomments the line #define DEBUG
+#define DEBUG
+#ifdef DEBUG 
+  #define DPRINT(...)    Serial.print(__VA_ARGS__) 
+  #define DPRINTLN(...)  Serial.println(__VA_ARGS__)
+#else
+  #define DPRINT(...)
+  #define DPRINTLN(...)
+#endif
 
-void setup() {
-  Serial.begin(115200); //for diagnostics
-  kLine.begin(4800); //SSM uses 4800 8N1 baud rate
-  
-}
+// ------------------------------------------------
+// END DEBUG
+// ------------------------------------------------
 
-void loop() {
-  
-  //these are buffers for displayable data
-  double parameter = 0;
-  String unit = "";
-  String title = "";
+// ------------------------------------------------
+// DEFINITIONS
+// ------------------------------------------------
 
+// AP - Define Serial Parameters Here
+#define SERIAL_DIAG_SPEED 115200
+#define SSM_BUS_SPEED 4800
+SoftwareSerial gSerialPort = SoftwareSerial(10, 11); // Rx, Tx
 
-  //battery voltage
-  if(serialCallSSM(kLine, pollECU_BattVolt, 10, ECUResponseBuffer, 2, 0) < 10)
+// AP - This section of code is from the github file I started from, not my code
+// //////////////////////////////////////////////////////////////////////////////
+// /////////////////////////////////////////////////////////////////////////////
+typedef struct {
+  byte header;
+  byte destination;
+  byte source;
+  byte dataSize;
+  byte *data;
+  byte checksum;
+} SSMPacket;
+
+enum SSMDevice {
+  kSSMDeviceECU = 0x10,
+  kSSMDeviceTCU = 0x18,
+  kSSMDeviceDiagTool = 0xF0,
+};
+
+enum SSMCommand {
+  kSSMCommandBlockRead = 0xA0,
+  kSSMCommandAddressRead = 0xA8,
+  kSSMCommandBlockWrite = 0xB0, 
+  kSSMCommandAddressWrite = 0xB8,
+  kSSMCommandECUInit = 0xBF,
+};
+
+enum SSMResponse {
+  kSSMResponseBlockRead = 0xE0,
+  kSSMResponseAddressRead = 0xE8,
+  kSSMResponseBlockWrite = 0xF0, 
+  kSSMResponseAddressWrite = 0xF8,
+  kSSMResponseECUInit = 0xFF,
+};
+
+enum SSMResponseType {
+  kSSMResponseTypeSingle = 0x00,
+  kSSMResponseTypeStreamed = 0x01,
+};
+
+byte SSMHeader = 0x80; //128
+byte SSMAddressSize = 0x3;
+byte SSMPacketDataOffset = 4;
+
+enum SSMRequestState {
+  SSMRequestInit,
+  SSMRequestBlock1,
+  SSMRequestBlock2,
+  SSMRequestSet1,
+};
+
+typedef struct {
+  SSMRequestState type;
+  byte location;
+  int length;  
+} SSMRequest;
+
+byte SSMMemory[304]; // 304 bytes should fit all the data
+SSMRequestState requestState = SSMRequestSet1;
+SSMRequest block1Request = { SSMRequestBlock1, 0x7, 98 };
+SSMRequest block2Request = { SSMRequestBlock2, 0xCE, 83 };
+
+byte SSMRequestSet1Size = 9;
+byte SSMRequestSet1Data[9] = {
+  0x0F, // Parameter: RPM low byte
+  0x0E, // Parameter: RPM high byte
+  0x0D, // Parameter: MAP
+  0x08, // Parameter: Temp
+  0x10, // Parameter: Speed
+  0x12, // Parameter: IAT
+  0x15, // Parameter: TPS
+  0x1C, // Parameter: Battery
+  0x46, // Parameter: AFR  
+};
+
+bool IsClearToSend = true;
+int SerialReadDelayMS = 2;
+unsigned long prvTime = 0;
+unsigned long curTime = 0;
+
+int oilPressurePin = 3;
+int fuelLevelPin = 4;
+
+typedef struct {
+  uint16_t canID;
+  uint16_t data[8];
+} SSMData;
+
+SSMData priority0[] = {
   {
-    //the battery voltage calc looks like: x*8/100 for units of Volts
-    double volts = ECUResponseBuffer[0] * 8.00;
-    volts = volts/100.00;
-    Serial.print(F("Battery Voltage: "));
-    Serial.println(volts);
-   
-    //update the buffers for displayable data
-    parameter = volts;
-    unit = F(" V");
-    title = F("Battery voltage");
-    delay(5000);  
+    0x259,// CAN ID 601
+    0x0F, // Engine Speed 2 (RPM)
+    0x0E, // Engine Speed 1 (RPM)
+    0x46, // Air/Fuel Sensor #1
+    0x15, // Throttle Opening Angle 
+    0x0D, // Manifold Absolute Pressure
+    0x10, // Vehicle Speed      
+    0x08, // Coolant Temperature    
+    0x4A, // Gear Position
+  },
+};
 
-}
-  Serial.println();
-}
+SSMData priority1[] = {
+  {
+    0x25A,// CAN ID 602
+    0x11, // Ignition Timing      
+    0x12, // Intake Air Temperature 
+    0x13, // Mass Air Flow 1   
+    0x14, // Mass Air Flow 2
+    0x16, // Front O2 Sensor #1   
+    0x17, // Front O2 Sensor #1 - 2
+    0x18, // Rear O2 Sensor
+    0x19, // Oil pressure (psi)
+  },
+  {
+    0x25B,// CAN ID 603
+    0x07, // Engine Load    
+    0x09, // Air/Fuel Correction #1 
+    0x0A, // Air/Fuel Learning #1   
+    0x0B, // Air/Fuel Correction #2 
+    0x0C, // Air/Fuel Learning #2   
+    0x1A, // Front O2 Sensor #2   
+    0x1B, // Front O2 Sensor #2 - 2
+    0x30, // Primary Wastegate Duty Cycle
+  }
+};
 
-boolean readSSM(SoftwareSerial &serialPort, uint8_t *dataBuffer, uint16_t bufferSize)
+SSMData priority2[] =  {
+  {
+    0x25C, // CAN ID - 604
+    0x23, // Atmospheric Pressure
+    0x1C, // Battery Voltage
+    0x1D, // Air Flow Sensor Voltage
+    0x1E, // Throttle Sensor Voltage
+    0x1F, // Diff Pres. Sens V.
+    0x20, // Fuel Injection #1 Pulse W
+    0x21, // Fuel Injection #2 Pulse W
+    0x22, // Knock Correction
+  },
+  {
+    0x25D, // CAN ID - 605
+    0x24, // Manifold Relative Pressure
+    0x25, // Pressure Differential Sensor
+    0x26, // Fuel Tank Pressure
+    0x27, // CO Adjustment
+    0x28, // Learned Ignition Timing
+    0x29, // Accelerator Opening Angle
+    0x2A, // Fuel Temperature
+    0x2B  // Front O2 Heater #1
+  },
+  {
+    0x25E, // CAN ID - 606
+    0x2C, // Rear O2 Heater Current
+    0x2D, // Front O2 Heater #2
+    0x2E, // Fuel Level (%)
+    0x31, // Secondary Wastegate Duty Cycle
+    0x32, // CPC Valve Duty Ratio
+    0x33, // Tumble Valve Position Sensor Right
+    0xD3, // Air/Fuel Adjustment Voltage
+  },
+  {
+    0x25F, // CAN ID
+    0x34, // Tumble Valve Position Sensor Left
+    0x35, // Idle Speed Control Valve Duty Ratio
+    0x36, // Air/Fuel Lean Correction
+    0x37, // Air/Fuel Heater Duty
+    0x38, // Idle Speed Control Valve Step
+    0x39, // Number of Ex. Gas Recirc Steps
+    0x3A, // Alternator Duty
+    0x3B, // Fuel Pump Duty
+  },
+  {
+    0x260, // CAN ID
+    0x3C, // VVT Advance Angle Right
+    0x3D, // VVT Advance Angle Left
+    0x3E, // OCV Duty Right
+    0x3F, // OCV Duty Left
+    0x40, // OCV Current Right
+    0x41, // OCV Current Left
+    0x42, // Air/Fuel Sensor #1 Current
+    0x43, // Air/Fuel Sensor #2 Current
+  },
+  {
+    0x261, // CAN ID
+    0x44, // Air/Fuel Sensor #1 Resistance
+    0x45, // Air/Fuel Sensor #2 Resistance
+    0x47, // Air/Fuel Sensor #2
+    0x53, // Air/Fuel Sensor #1 Heater Current
+    0x54, // Air/Fuel Sensor #2 Heater Current
+    0xD0, // Air/Fuel Correction #3
+    0xD1, // Air/Fuel Learning #3
+    0xD2, // Rear O2 Heater Voltage
+  }
+};
+
+SSMData priority3[] = {
+  {
+    0x262, // CAN ID
+    0xCE, // Roughness Monitor Cylinder #1
+    0xCF, // Roughness Monitor Cylinder #2
+    0xD8, // Roughness Monitor Cylinder #4
+    0xD9, // Roughness Monitor Cylinder #3
+    0xFA, // Throttle Motor Duty
+    0xFB, // Throttle Motor Voltage
+    0x120, // Switch - "ETC Motor Relay"
+    0x121, // Switch - "Accel", "Brake", "Clutch", etc...
+  },
+  {
+    0x263,  // CAN ID
+    0x100, // Sub Throttle Sensor
+    0x101, // Main Throttle Sensor
+    0x102, // Sub Accelerator Sensor
+    0x103, // Main Accelerator Sensor
+    0x104, // Brake Booster Pressure
+    0x105, // Fuel Pressure (High)
+    0x106, // Exhaust Gas Temperature
+    0x108, // Cold Start Injector
+  },
+  {
+    0x264, // CAN ID
+    0x61,
+    0x62,
+    0x63,
+    0x64,
+    0x65,
+    0x66,
+    0x67, // skip 0x68...
+    0x69,
+  },
+};
+
+typedef SSMData SSMData_Array[];
+
+typedef struct {
+  byte cycleCount;
+  byte cycle;
+  byte index;
+  byte numIndexes;
+} CanPriority;
+
+#define NUM_CAN_PRIORITIES 4
+
+// cycleCount | cycle to trigger on | current index | numIndexes // 
+CanPriority counterSchedule[NUM_CAN_PRIORITIES] = { 
+   {0, 1, 0, 1},
+   {0, 2, 0, 2},
+   {0, 4, 0, 6},
+   {0, 6, 0, 3}
+};
+
+// ///////////////////////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////////////////////
+
+// AP - Setup all values to be read as varaibles for debugging and easy to read code.
+//Engine Speed
+  unsigned int RPM; 
+  double AFR; 
+// Colant Temperature
+  double CTS; 
+// Throttle Position
+  double TPS; 
+// Manifold Absolute Pressure
+  double MAP; 
+// Vehicle Speed
+  double MPH; 
+// Transmission Gear (calculated)
+  double GEAR; 
+//Timing
+  double ADV; 
+//Intake Air
+  double IAT; 
+// Mass Air Flow
+  unsigned int MAF; 
+// Front Oxygen
+  unsigned int OXY; 
+// Engine Load
+  double LOAD; 
+// Battery Voltage
+  double VOLT; 
+// Accelerator Opening Angle
+  double ACC; 
+// Fuel Level
+  double FUEL; 
+// Manifold Relative Pressure
+  double Boost; 
+// Throttle Sensor
+  double Throttle; 
+// Cruise Set Speed
+  double CruiseSpeed; 
+
+// ------------------------------------------------
+// END DEFINITIONS
+// ------------------------------------------------
+
+
+// -----------------------------------------------
+//  SETUP
+// -----------------------------------------------
+void setup()
 {
-  //read in an SSM serial response packet, place the data bytes in the data buffer
-  //and return a boolean value indicating whether the checksum failed
-  uint16_t timeout = 100;//100 millisecond timeout for response
-  uint32_t timerstart = millis();//start the timer
-  boolean notFinished = true;//a flag to indicate that we are done
-  boolean checksumSuccess = false;
-  uint8_t dataSize = 0;
-  uint8_t calcSum = 0;
-  uint8_t packetIndex = 0;
+  DPRINTLN("Connecting to Serial...");
+  Serial.begin(SERIAL_DIAG_SPEED); //for diagnostics
+  while (!Serial) {
+    delay(50);
+  }
 
-  Serial.print(F("Read Packet: [ "));
-  while(millis() - timerstart <= timeout && notFinished)
-  {
-    if(serialPort.available() > 0)
-    {
-      uint8_t data = serialPort.read();
-      Serial.print(data);
-      Serial.print(F(" "));//if not printing data, be sure to delay to allow for more bytes to come in
-      if(packetIndex == 0 && data == 128)
-      {
-        //0x80 or 128 marks the beginning of a packet
-        packetIndex += 1;
-        calcSum += data;
+  DPRINTLN("Initializing SSM serial port...");
+  gSerialPort.begin(SSM_BUS_SPEED); //SSM uses 4800 8N1 baud rate
+  do{
+    delay(50);
+  } while (!gSerialPort);
+  DPRINTLN("SSM Serial Line Established.");
+
+  prvTime = millis();
+}
+// ------------------------------------------------
+// END SETUP
+// ------------------------------------------------
+
+
+// -----------------------------------------------
+//  LOOP
+// -----------------------------------------------
+void loop()
+{
+  curTime = millis();
+  if ((curTime - prvTime) > 1000) {
+    gSerialPort.flush();
+    DPRINTLN("-----flush-----");
+    sendSSMRequestForState(requestState); // re-send the current request
+    prvTime = curTime;
+  }
+
+  if (readSSMResponse()) {
+    prvTime = curTime;
+    IsClearToSend = true;
+  }
+  SSMtoVars();
+
+//    readAnalogPinsIntoSSMMemory();
+  
+  if (IsClearToSend) {
+    sendSSMRequestForState(requestState);
+    IsClearToSend = false;
+  }
+}
+// ------------------------------------------------
+// END LOOP
+// ------------------------------------------------
+
+// ------------------------------------------------
+// SSM COMMUNICATIONS AND VALUES
+// ------------------------------------------------
+
+// AP - THIS CODE IS FROM THE INITIAL GITHUB SOURCE
+// ///////////////////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////////////////
+
+void sendSSMRequestForState(SSMRequestState state)
+{
+  switch (state) {
+    case SSMRequestInit:
+      DPRINTLN("Requesting SSM init...");
+      sendSSMPacket(packetForSSMInit(), gSerialPort);
+      break;
+      
+    case SSMRequestBlock1:
+      DPRINTLN("Requesting SSM block 1...");
+      sendSSMPacket(packetForBlockRead(block1Request.location, block1Request.length), gSerialPort);
+      break;
+
+    case SSMRequestBlock2:
+      DPRINTLN("Requesting SSM block 2...");
+      sendSSMPacket(packetForBlockRead(block2Request.location, block2Request.length), gSerialPort);
+      break;
+
+    case SSMRequestSet1:
+      DPRINTLN("Requesting SSM set 1...");
+      SSMPacket *p = packetForNumberOfAddresses(kSSMCommandAddressRead, 9);
+      for (byte i=1; i<=SSMRequestSet1Size; i++){
+        p->data[1 + (3*i)] = SSMRequestSet1Data[i-1];
       }
-      else if(packetIndex == 1 && data == 240)
-      {
-        //this byte indicates that the message recipient is the 'Diagnostic tool'
-        packetIndex += 1;
-        calcSum += data;
+      sendSSMPacket(p, gSerialPort);
+      break;
+  }
+}
+
+bool readSSMResponse() {
+  if (!gSerialPort.available()) {
+    return false;
+  }  
+
+  SSMPacket *packet = readPacketFromSSMBus();
+  if (!packet) {
+     DPRINT("ERR: Could not create SSM response packet for request state: ");
+     DPRINTLN(requestState);
+     return false;
+  }
+
+  switch (requestState) {
+    case SSMRequestInit: 
+      requestState = SSMRequestBlock1;      
+      //requestState = SSMRequestSet1;      
+      break;
+    case SSMRequestBlock1:
+      // advance past the response code
+      memcpy(&SSMMemory[block1Request.location], packet->data + 1, packet->dataSize - 1);      
+      // next state
+      requestState = SSMRequestBlock2;
+      break;
+    case SSMRequestBlock2:
+      // advance past the response code
+      memcpy(&SSMMemory[block2Request.location], packet->data + 1, packet->dataSize - 1);
+      // next state
+      requestState = SSMRequestBlock1;
+      break;
+    case SSMRequestSet1:
+      for (byte i=1; i<=(packet->dataSize - 1); i++){
+        SSMMemory[ SSMRequestSet1Data[i-1] ] = packet->data[i];
       }
-      else if(packetIndex == 2 && data == 16)
-      {
-        //this byte indicates that the message sender is the ECU
-        packetIndex += 1;
-        calcSum += data;
+      break;
+  }
+  
+  freePacket(packet);
+  return true;
+}
+
+//   Packet Builders
+SSMPacket *packetForSSMInit() {
+  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
+  packet->header = SSMHeader;
+  packet->destination = kSSMDeviceECU;
+  packet->source = kSSMDeviceDiagTool;
+  packet->dataSize = 1;
+  packet->data = (byte *)malloc( packet->dataSize );
+  packet->data[0] = kSSMCommandECUInit;
+  return packet;
+}
+
+SSMPacket *packetForBlockRead(byte baseByte, byte numberOfBytes) {
+  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
+  packet->header = SSMHeader;
+  packet->destination = kSSMDeviceECU;
+  packet->source = kSSMDeviceDiagTool;
+  packet->dataSize = 6;
+  packet->data = (byte *)malloc( packet->dataSize );
+  packet->data[0] = kSSMCommandBlockRead;
+  packet->data[1] = kSSMResponseTypeSingle;
+  packet->data[2] = 0x00;
+  packet->data[3] = 0x00;
+  packet->data[4] = baseByte;
+  packet->data[5] = (numberOfBytes-1);
+  return packet;
+}
+
+SSMPacket *packetForNumberOfAddresses(SSMCommand command, byte numberOfBytes) {
+  int addressRequestSize = SSMAddressSize * numberOfBytes;
+  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
+  packet->header = SSMHeader;
+  packet->destination = kSSMDeviceECU;
+  packet->source = kSSMDeviceDiagTool;  
+  packet->dataSize = (2 + addressRequestSize);
+  packet->data = (byte *)malloc( packet->dataSize );
+  packet->data[0] = command;
+  packet->data[1] = kSSMResponseTypeSingle;
+  for (byte i=0; i < addressRequestSize; i++) {
+     packet->data[2+i] = 0x0;
+  }
+  return packet;
+}
+
+void freePacket(SSMPacket *packet) {
+  if (packet->data)
+    free(packet->data);
+  if (packet)
+    free(packet);
+}
+
+//  Transport
+void sendSSMPacket(SSMPacket *packet, SoftwareSerial &ss) {
+  DPRINT("0x");
+  DPRINT(((byte *)packet)[0], HEX);
+  DPRINTLN(" - header");
+  
+  DPRINT("0x");
+  DPRINT(((byte *)packet)[1], HEX);
+  DPRINTLN(" - destination");
+
+  DPRINT("0x");
+  DPRINT(((byte *)packet)[2], HEX);
+  DPRINTLN(" - source");
+
+  DPRINT("0x");
+  DPRINT(((byte *)packet)[3], HEX);
+  DPRINTLN(" - dataSize");
+
+  int numBytesWritten = 0;
+
+  byte checksum = 0;
+  for (byte i = 0; i < SSMPacketDataOffset; i++) {
+    byte value = ((byte *)packet)[i];
+    checksum += value;
+    numBytesWritten += ss.write(value);
+  }
+
+  for (byte i = 0; i < packet->dataSize; i++) {
+    byte value = packet->data[i];
+    DPRINT("0x");
+    DPRINT(value, HEX);
+    DPRINTLN(" - data");
+
+    checksum += value;
+    numBytesWritten += ss.write(value);
+  }
+
+  DPRINT("0x");
+  DPRINT(checksum, HEX);
+  DPRINTLN(" - checksum");
+  
+  numBytesWritten += ss.write(checksum);
+
+  DPRINTLN(" ");
+
+  freePacket(packet);
+}
+
+/* returns the 8 least significant bits of an input byte*/
+byte computeChecksum(byte sum) {
+  byte counter = 0;
+  byte power = 1;
+  for (byte n = 0; n < 8; n++) {
+    counter += bitRead(sum, n) * power;
+    power = power * 2;
+  }
+  return counter;
+}
+
+//
+// This will change the values in dataArray, populating them with 
+// values respective of the poll array address calls
+SSMPacket *readPacketFromSSMBus() {
+  SSMPacket *packet = (SSMPacket *)malloc( sizeof(SSMPacket) );
+  packet->data = NULL;
+  boolean isPacket = false;
+  
+  byte data = 0;
+  byte *dataArray;
+  int numReadExpected;
+  int numReadActual;
+  
+  byte sumBytes = 0;
+  int dataSize = 0;
+  byte bytePlace = 0;
+  byte loopLength = 20;
+
+  //DPRINTLN("-------- read ----------");
+
+  numReadExpected = 1;
+
+  for (byte j = 0; j < loopLength; j++) {
+    if (!gSerialPort.available()) {
+      delay(SerialReadDelayMS);
+      continue;
+    }
+
+    numReadActual = gSerialPort.readBytes(&data, numReadExpected);
+  
+    // Header marks the beginning of a packet
+    if (data == SSMHeader && dataSize == 0) {
+      isPacket = true;
+      j = 0;
+      DPRINTLN("--------Begin Packet--------");
+    }
+
+    // Terminate if no response is detected
+    if (!isPacket && (j == (loopLength - 1))) {
+      DPRINTLN("no data");
+      break;
+    }
+
+    if (!isPacket || numReadActual == 0) {
+      delay(SerialReadDelayMS);
+      continue;
+    }
+
+    DPRINT(bytePlace);
+    DPRINT(" ");
+    DPRINT("0x");
+    DPRINT(data, HEX);
+    
+    if (bytePlace == 0) {
+      DPRINT(" - header");
+      packet->header = data;
+    }
+    else if (bytePlace == 1) {
+      DPRINT(" - destination");
+      packet->destination = data;
+    }
+    else if (bytePlace == 2) {
+      DPRINT(" - source");
+      packet->source = data;
+    }
+    else if (bytePlace == 3) { // how much data is coming
+      dataSize = data;
+      packet->dataSize = dataSize;
+      packet->data = (byte *)malloc( packet->dataSize );
+      DPRINT(" - data size: ");
+      DPRINT(packet->dataSize);
+
+      loopLength += dataSize;
+    }
+    else if (bytePlace > 3 && bytePlace - 4 < dataSize) {
+      packet->data[bytePlace - 4] = data;
+      DPRINT(" - b:");
+      DPRINT((bytePlace - 3));
+    }
+    else if (bytePlace == (4 + dataSize)) {
+      DPRINTLN(" - checksum");
+      
+      // the 8 least significant bits of sumBytes
+      if (data == computeChecksum(sumBytes)) {
+        DPRINTLN("------ End Packet ------");
+        DPRINTLN("");
+        return packet;
       }
-      else if(packetIndex == 3)
-      {
-        //this byte indicates the number of data bytes which follow
-        dataSize = data;
-        packetIndex += 1;
-        calcSum += data;
-      }
-      else if(packetIndex == 4)
-      {
-        //I don't know what this byte is for
-        packetIndex += 1;
-        calcSum += data;
-      }
-      else if(packetIndex > 4 && packetIndex < (dataSize+4))
-      {
-        //this byte is data
-        if(packetIndex - 5 < bufferSize)//make sure it fits into the buffer
-        {
-          dataBuffer[packetIndex - 5] = data;
-        }
-        packetIndex += 1;
-        calcSum += data;
-      }
-      else if(packetIndex == dataSize + 4)
-      {
-        //this is the checksum byte
-        if(data == calcSum)
-        {
-          //checksum was successful
-          checksumSuccess = true;
-        }
-        else
-        {
-          Serial.print(F("Checksum fail "));
-        }
-        notFinished = false;//we're done now
+      else {
+        DPRINT("ERR: Checksum: ");
+        DPRINT(data, HEX);
+        DPRINT(" != calculated: ");
+        DPRINT(computeChecksum(sumBytes), HEX);
+        DPRINTLN("");
         break;
       }
-      timerstart = millis();//reset the timeout if we're not finished
     }
+
+    sumBytes += data; // this is to compare with the checksum byte
+    bytePlace++;
+    
+    DPRINTLN("");
   }
-  Serial.println(F("]"));
-  if(notFinished)
-  {
-    Serial.println(F("Comm. timeout"));
-    delay(1000);
-  }
-  return checksumSuccess;
+
+  DPRINTLN("--------returning----------");
+  freePacket(packet);
+  return NULL;
 }
+// /////////////////////////////////////////////////////////////////////
+// /////////////////////////////////////////////////////////////////////
 
-//writes data over the software serial port
-void writeSSM(SoftwareSerial &serialPort, uint8_t *dataBuffer, uint8_t bufferSize) {
-  //this function needs to catch mistakes that I make in preparing 
-  //the packets -> {128, 16, 240, #data, 168, cont. response flag, addr1,addr2,addr3,checksum} = 10 bytes, 5 of which are data
-  dataBuffer[0] = 128;//begin packet
-  dataBuffer[1] = 16;//to subaru ECU
-  dataBuffer[2] = 240;//from diagnostic tool
-  //number of data bytes include 3*(number of addresses), cont. response flag, and mode (address read)
-  //this means that the header, to, from, #data, and checksum are not part.
-  dataBuffer[3] = bufferSize - 5;//# data bytes
-  dataBuffer[4] = 168;//single address read
-  dataBuffer[5] = 0;//no continuous polling
-  uint8_t sum = 0;
-  Serial.print(F("Sending packet: [ "));
-  for (uint8_t x = 0; x < bufferSize; x++) {
-    if(x == bufferSize - 1 && sum != dataBuffer[x])
-    {
-      dataBuffer[x] = sum;//fix the checksum in the data buffer
-    }
-    else
-    {
-      sum += dataBuffer[x];//build the checksum
-    }
-    serialPort.write(dataBuffer[x]);
-    Serial.print(dataBuffer[x]);
-    Serial.print(F(" "));
-  }
-  Serial.println(F("]"));
-}
+// AP - MOVE ALL THE VALUES WE CARE ABOUT FROM AN ARRAY TO VARIABLES FOR EASY DEBUGGING AND USABLE CODE.  DO ALL MATH HERE
+void SSMtoVars() {
 
-uint8_t serialCallSSM(SoftwareSerial &serialPort, uint8_t *sendDataBuffer, uint16_t sendBufferSize, uint8_t *receiveDataBuffer, uint16_t receiveBufferSize, uint8_t attempts)
-{
-  //this function performs the call and response routine for 
-  //exchanging serial data with the Subaru ECU via SSM
-  //it sends a message and awaits a response, resending the 
-  //message if we reach timeout or if the checksum failed
-  //it stops trying the data exchange if 10 failures occur and 
-  //it outputs the number of attempts it failed to send data
-  //input: handle to software serial pins
-  //  buffer with outgoing data and length of buffer
-  //  buffer for received data (not the whole packet), and length of buffer
-  //  the initial value for a counter of failed attempts
+DPRINTLN("Convering SSM Memory into Variables");
+//Engine Speed
+  RPM = (SSMMemory[0x0E]*256 + SSMMemory[0x0F])/4; //combine high bit and low bit and then divide by 4;  
+// Air Fuel Ratio
+  AFR = SSMMemory[0x46] / 128;  // divide by 128 to get lambda
+// Colant Temperature
+  CTS = ((SSMMemory[0x08]-40) * 9/5) + 32; //subtract 40 to get C, then convert to F
+// Throttle Position
+  TPS = SSMMemory[0x15] * 100/255; // multiply by 100 and then divide by 255 to get %
+// Manifold Absolute Pressure
+  MAP = SSMMemory[0x0D] * 37/255; //multiply by 37 and divide by 255
+// Vehicle Speed
+  MPH = SSMMemory[0x10] * 0.621371; //convert from KPH to MPH
+// Transmission Gear (calculated)
+  GEAR = SSMMemory[0x4A] + 1; // 1st gear = 0 in ECU
+//Timing
+  ADV = (SSMMemory[0x11] - 128)/2;  // conversion to get to degrees
+//Intake Air
+  IAT = ((SSMMemory[0x12] -40) * 9/5) +32; //subtract 40 to get C, then convert to F
+// Mass Air Flow
+  MAF = (SSMMemory[0x13]*256 + SSMMemory[0x14])/100; // combine high bit and low bit and then divide by 100 to get g/s
+// Front Oxygen
+  OXY = (SSMMemory[0x16]*256 + SSMMemory[0x17]) * 0.005;  // value in volts
+// Engine Load
+  LOAD = SSMMemory[0x07] * 100/255; // multiply by 100 and then divide by 255 to get %
+// Battery Voltage
+  VOLT = SSMMemory[0x1C] * 8/100; // mutliply by 8 and divide by 100
+// Accelerator Opening Angle
+  ACC = SSMMemory[0x29]/2.56;  // divide by 2.56
+// Fuel Level
+  FUEL = (SSMMemory[0x2E] * 0.02)*100/5; // multiply by 0.02 to get volts. Divide by 5 and multiply by 100 to get %
+// Manifold Relative Pressure
+  Boost = (SSMMemory[0x24] - 128)*37/255;  // subtract 128, multiply by 37, divide by 255 to get psig
+// Throttle Sensor
+  Throttle = (SSMMemory[0x103] * 0.02) * 100/5;  //multiply by 0.02 to get volts. Divide by 5 and multiply by 100 to get %
+// Cruise Set Speed
+  CruiseSpeed = SSMMemory[0x108] * 0.621371; // convert from KPH to MPH
 
-  writeSSM(serialPort, sendDataBuffer, sendBufferSize);//send the message
-  boolean success = readSSM(serialPort, receiveDataBuffer, receiveBufferSize);//receive the response
-  uint8_t newAttempt = 0;
-  
-  if(!success && attempts < 10)
-  {
-    Serial.println(F("Packet exchange failed, trying again... "));
-    newAttempt = serialCallSSM(serialPort, sendDataBuffer, sendBufferSize, receiveDataBuffer, receiveBufferSize, attempts + 1);
-  }
-  newAttempt += attempts;
-  
-  return newAttempt;
+// Print all vars to serial if DEBUG is turned on
+  DPRINT("Engine Speed (RPM): ");
+  DPRINTLN(RPM);
+
+  DPRINT("Air Fuel Ratio (lambda): ");
+  DPRINTLN(AFR);
+
+  DPRINT("Coolant Temp (F): ");
+  DPRINTLN(CTS);
+
+  DPRINT("Throttle Position (%): ");
+  DPRINTLN(TPS);
+
+  DPRINT("Manifold Abs Press (psig): ");
+  DPRINTLN(MAP);
+
+  DPRINT("Speed (mph): "); 
+  DPRINTLN(MPH);
+
+  DPRINT("Transmission Gear (calc): ");
+  DPRINTLN(GEAR);
+
+  DPRINT("Timing Advance (degrees): ");
+  DPRINTLN(ADV);
+
+  DPRINT("Intake Air Temp (F): ");
+  DPRINTLN(IAT);
+
+  DPRINT("Mass Air Flow (g/s): ");
+  DPRINTLN(MAF);
+
+  DPRINT("Oxygen Sensor (%): ");
+  DPRINTLN(OXY);
+
+  DPRINT("Engine Load (%): ");
+  DPRINTLN(LOAD);
+
+  DPRINT("Battery Voltage: ");
+  DPRINTLN(VOLT);  
+
+  DPRINT("Accelerator Opening Position (%): ");
+  DPRINTLN(ACC);
+
+  DPRINT("Fuel Level (%): ");
+  DPRINTLN(FUEL);
+
+  DPRINT("Boost (psig): ");
+  DPRINTLN(Boost);
+
+  DPRINT("Throttle Pedal Position (%): ");
+  DPRINTLN(Throttle);
+
+  DPRINT("Cruies Set Speed (mph): ");
+  DPRINTLN(CruiseSpeed);
 }
