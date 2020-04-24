@@ -1,7 +1,9 @@
 // =========================================================
-// Program Name: SSMReadDashInfo
+// Program Name: SSM2RealDash-Mega
 // Current Version Arthor: Alan Polk
 // https://github.com/alan-polk/subduino
+// https://thefactoryfiveforum.com/showthread.php?34088-Subaru-SSM-to-Can-Bus-Convertor-DIY
+// Check the forum thread for wiring diagrams
 // ==========================================================
 // This started as a fork of Matt Prophet's  Subduino Project.  
 // But as someone who teaching themselves C++ as part of the project
